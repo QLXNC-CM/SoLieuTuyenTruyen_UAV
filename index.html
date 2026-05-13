@@ -4,7 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>KẾT QUẢ VẬN ĐỘNG, TUYÊN TRUYỀN TỔ CHỨC, CÁ NHÂN CHẤP HÀNH QUY ĐỊNH PHÁP LUẬT VỀ SỬ DỤNG THIẾT BỊ BAY KHÔNG NGƯỜI LÁI</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+  <link rel="dns-prefetch" href="https://cdn.jsdelivr.net">
+  <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
   <style>
     :root{
       --primary:#165dff;--primary2:#0f3fa8;--green:#0e9f6e;--orange:#f59e0b;--red:#dc2626;
@@ -286,6 +288,8 @@ const METRICS = [
 let app = { areas:[], reports:[], settings:{}, users:[] };
 let mainChart = null;
 let areaChart = null;
+let mainChartType = '';
+let areaChartType = '';
 let adminAuth = null;
 let adminUser = null;
 let adminUsers = [];
@@ -302,7 +306,8 @@ const todayISO = () => {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 };
-const html = s => String(s ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+const _ESC = {'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'};
+const html = s => String(s ?? '').replace(/[&<>'"]/g, c => _ESC[c]);
 const num = v => Number.isFinite(Number(v)) && Number(v) > 0 ? Math.round(Number(v)) : 0;
 const fmt = v => new Intl.NumberFormat('vi-VN').format(num(v));
 const dateText = d => d ? d.split('-').reverse().join('/') : '';
@@ -371,13 +376,9 @@ async function testConnection(showAlert=true){
   }
 }
 
-async function refreshData(checkConnection=true){
+async function refreshData(checkConnection=false){
   try{
-    if(checkConnection){
-      setApiStatus('Đang kiểm tra kết nối Apps Script...', 'wait');
-      await callApi('ping', {});
-    }
-    setApiStatus('Kết nối thành công, đang tải dữ liệu từ Google Sheet...', 'wait');
+    setApiStatus('Đang tải dữ liệu từ Google Sheet...', 'wait');
     const data = await callApi('getPublicData', {});
     app.areas = Array.isArray(data.areas) ? data.areas : [];
     app.reports = Array.isArray(data.reports) ? data.reports.map(normalizeReport) : [];
@@ -390,7 +391,7 @@ async function refreshData(checkConnection=true){
     populateOptions();
     rebuildAuthUserList();
     renderAll();
-    setApiStatus('Đã kiểm tra kết nối và tải dữ liệu thành công.', 'ok');
+    setApiStatus('Đã tải dữ liệu thành công.', 'ok');
     $('lastUpdatedPill').textContent = 'Cập nhật: ' + nowText();
   }catch(err){
     console.error(err);
@@ -398,7 +399,6 @@ async function refreshData(checkConnection=true){
     renderEmptyOnError(err.message);
   }
 }
-
 
 function normalizeReport(r){
   const copy = Object.assign({}, r);
@@ -607,6 +607,8 @@ function buildAuthUserOptions(){
     const title = displayValue || loginValue;
     const identifiers = [u.phone ? 'SĐT: ' + u.phone : '', u.username ? 'Tên đăng nhập: ' + u.username : ''].filter(Boolean).join(' / ');
     const meta = [identifiers, area, u.position].filter(Boolean).join(' • ');
+    const searchText = normalizeSearchText([u.fullName, u.phone, u.username, area, u.position, title, loginValue].filter(Boolean).join(' '));
+    const sortText = normalizeSearchText(title);
     options.push({
       value: title,
       loginValue,
@@ -615,10 +617,12 @@ function buildAuthUserOptions(){
       phone: u.phone || '',
       username: u.username || '',
       fullName: u.fullName || '',
-      search: normalizeSearchText([u.fullName, u.phone, u.username, area, u.position, title, loginValue].filter(Boolean).join(' '))
+      search: searchText,
+      _search: searchText,
+      _sort: sortText
     });
   });
-  options.sort((a,b) => normalizeSearchText(a.title).localeCompare(normalizeSearchText(b.title), 'vi'));
+  options.sort((a,b) => (a._sort || '').localeCompare(b._sort || '', 'vi'));
   return options;
 }
 
@@ -638,7 +642,7 @@ function renderAuthUserMenu(query='', loading=false){
   const terms = q.split(/\s+/).filter(Boolean);
   let rows = authUserOptions.filter(item => {
     if(!q) return true;
-    const haystack = [item.search, item.value, item.loginValue, item.title, item.meta].map(normalizeSearchText).join(' ');
+    const haystack = item._search || item.search || '';
     return terms.every(term => haystack.includes(term));
   }).slice(0, 40);
 
@@ -736,7 +740,15 @@ function getFilteredReports(){
 }
 
 function renderAll(){
-  renderKpis(); renderCharts(); renderReportTable(); renderTodayReportStatus(); loadReportForForm(); renderAdminReports(); fillSettingsForm();
+  renderKpis();
+  renderCharts();
+  renderReportTable();
+  renderTodayReportStatus();
+  loadReportForForm();
+  if(adminAuth){
+    renderAdminReports();
+    fillSettingsForm();
+  }
 }
 
 function renderKpis(){
@@ -747,6 +759,40 @@ function renderKpis(){
       <div class="value">${fmt(totals[m.key])}</div>
       <div class="sub">${html(m.label)}</div>
     </div>`).join('');
+}
+
+function makeChartOptions(label, data, extraOptions={}){
+  const maxValue = Math.max(...data, 0);
+  const base = {
+    responsive:true,
+    maintainAspectRatio:false,
+    layout:{ padding:{ top:24 } },
+    plugins:{ legend:{ display:false }, tooltip:{ callbacks:{ label:(ctx) => `${ctx.dataset.label}: ${fmt(ctx.raw)}` } } },
+    scales:{ y:{ beginAtZero:true, suggestedMax: maxValue * 1.18 || 10 } }
+  };
+  return Object.assign(base, extraOptions);
+}
+
+function createOrUpdateChart(currentChart, canvasId, type, labels, data, label, datasetOptions={}, extraOptions={}){
+  if(typeof Chart === 'undefined') return currentChart;
+  const options = makeChartOptions(label, data, extraOptions);
+  if(!currentChart || currentChart.config.type !== type){
+    if(currentChart) currentChart.destroy();
+    return new Chart($(canvasId), {
+      type,
+      data:{ labels, datasets:[Object.assign({ label, data, borderWidth:3, tension:.25, fill:false }, datasetOptions)] },
+      plugins:[chartValueLabels],
+      options
+    });
+  }
+  currentChart.data.labels = labels;
+  currentChart.data.datasets[0].label = label;
+  currentChart.data.datasets[0].data = data;
+  Object.assign(currentChart.data.datasets[0], datasetOptions);
+  currentChart.options.scales.y.suggestedMax = Math.max(...data, 0) * 1.18 || 10;
+  Object.assign(currentChart.options, extraOptions);
+  currentChart.update('none');
+  return currentChart;
 }
 
 function renderCharts(){
@@ -774,33 +820,29 @@ function renderCharts(){
   }
 
   $('mainChartTitle').textContent = title;
-  if(mainChart) mainChart.destroy();
-  mainChart = new Chart($('mainChart'), {
-    type: mode === 'daily' ? 'line' : 'bar',
-    data:{ labels, datasets:[{ label:title, data, borderWidth:3, tension:.25, fill:false }] },
-    plugins:[chartValueLabels],
-    options:{
-      responsive:true,
-      maintainAspectRatio:false,
-      layout:{ padding:{ top:24 } },
-      plugins:{ legend:{ display:false }, tooltip:{ callbacks:{ label:(ctx) => `${ctx.dataset.label}: ${fmt(ctx.raw)}` } } },
-      scales:{ y:{ beginAtZero:true, suggestedMax: Math.max(...data, 0) * 1.18 || 10 } }
-    }
-  });
+  const mainType = mode === 'daily' ? 'line' : 'bar';
+  mainChart = createOrUpdateChart(
+    mainChart,
+    'mainChart',
+    mainType,
+    labels,
+    data,
+    title,
+    { borderWidth:3, tension:.25, fill:false },
+    {}
+  );
 
   const areaLabels = app.areas.map(a => a.name);
   const areaData = app.areas.map(a => entries.filter(r => r.areaId === a.areaId).reduce((s,r) => s + metricValue(r, selectedMetric), 0));
-  if(areaChart) areaChart.destroy();
-  areaChart = new Chart($('areaChart'), {
-    type:'bar',
-    data:{ labels:areaLabels, datasets:[{ label:metricLabel(selectedMetric), data:areaData, borderWidth:2 }] },
-    plugins:[chartValueLabels],
-    options:{
-      responsive:true,
-      maintainAspectRatio:false,
-      layout:{ padding:{ top:24 } },
-      plugins:{ legend:{ display:false }, tooltip:{ callbacks:{ label:(ctx) => `${ctx.dataset.label}: ${fmt(ctx.raw)}` } } },
-      scales:{ y:{ beginAtZero:true, suggestedMax: Math.max(...areaData, 0) * 1.18 || 10 } },
+  areaChart = createOrUpdateChart(
+    areaChart,
+    'areaChart',
+    'bar',
+    areaLabels,
+    areaData,
+    metricLabel(selectedMetric),
+    { borderWidth:2, tension:.25, fill:false },
+    {
       onClick:(event, elements) => {
         if(!elements || !elements.length) return;
         const area = app.areas[elements[0].index];
@@ -810,7 +852,7 @@ function renderCharts(){
         if(event && event.native && event.native.target) event.native.target.style.cursor = elements && elements.length ? 'pointer' : 'default';
       }
     }
-  });
+  );
   renderAreaChartDetail(null);
 }
 
@@ -1190,7 +1232,7 @@ function initDefaults(){
 
 document.addEventListener('DOMContentLoaded', async () => {
   METRICS.forEach(m => { if(!$(m.key)) console.warn('Missing input', m.key); });
-  bindEvents(); initDefaults(); await refreshData(true);
+  bindEvents(); initDefaults(); await refreshData(false);
 });
 </script>
 </body>
