@@ -351,7 +351,7 @@ let savingReport = false;
 let activeQuickFilter = '';
 let detailTableState = { query:'', sortKey:'date', sortDir:'desc' };
 let localUpdatedAtOverrides = {};
-const LOCAL_UPDATED_AT_OVERRIDE_MS = 10 * 60 * 1000;
+const LOCAL_UPDATED_AT_OVERRIDE_MS = 60 * 60 * 1000;
 const VIETNAM_TIMEZONE = 'Asia/Ho_Chi_Minh';
 const PUBLIC_CACHE_KEY = 'uav_public_data_cache_v3';
 const PUBLIC_CACHE_MAX_AGE_MS = 10 * 60 * 1000;
@@ -438,17 +438,57 @@ function setFilterUpdatedAtNow(){
 }
 
 function normalizeReportDateKey(value){
+  if(value instanceof Date && !Number.isNaN(value.getTime())){
+    const parts = new Intl.DateTimeFormat('vi-VN', {
+      timeZone: VIETNAM_TIMEZONE, year:'numeric', month:'2-digit', day:'2-digit'
+    }).formatToParts(value).reduce((acc, part) => {
+      if(part.type !== 'literal') acc[part.type] = part.value;
+      return acc;
+    }, {});
+    return `${parts.year}-${pad2(parts.month)}-${pad2(parts.day)}`;
+  }
+  if(typeof value === 'number' && isGoogleSheetSerialDate(value)){
+    const d = new Date(Math.round((value - 25569) * 86400000));
+    if(!Number.isNaN(d.getTime())) return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+  }
   const s = String(value || '').trim();
   if(!s) return '';
+  if(/^\d+(?:[.,]\d+)?$/.test(s)){
+    const n = Number(s.replace(',', '.'));
+    if(isGoogleSheetSerialDate(n)){
+      const d = new Date(Math.round((n - 25569) * 86400000));
+      if(!Number.isNaN(d.getTime())) return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+    }
+  }
   const iso = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
   if(iso) return `${iso[1]}-${pad2(iso[2])}-${pad2(iso[3])}`;
-  const vn = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
+  const vn = s.match(/(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})/);
   if(vn) return `${vn[3]}-${pad2(vn[2])}-${pad2(vn[1])}`;
+  const jsDate = new Date(s);
+  if(!Number.isNaN(jsDate.getTime())) return normalizeReportDateKey(jsDate);
   return s;
 }
 
 function reportLocalKey(areaId, reportDate){
   return `areaDate__${normalizeSearchText(areaId)}__${normalizeReportDateKey(reportDate)}`;
+}
+
+function reportAreaAliases(areaValue){
+  const aliases = new Set();
+  const raw = String(areaValue || '').trim();
+  if(raw) aliases.add(raw);
+  const rawNorm = normalizeSearchText(raw);
+  app.areas.forEach(a => {
+    const id = String(a.areaId || '').trim();
+    const name = String(a.name || '').trim();
+    if(!rawNorm || normalizeSearchText(id) === rawNorm || normalizeSearchText(name) === rawNorm){
+      if(id) aliases.add(id);
+      if(name) aliases.add(name);
+    }
+  });
+  const namedArea = areaName(raw);
+  if(namedArea) aliases.add(namedArea);
+  return [...aliases].filter(Boolean);
 }
 
 function reportOverrideKeys(report){
@@ -457,11 +497,34 @@ function reportOverrideKeys(report){
   const reportId = String(report.reportId || '').trim();
   if(reportId) keys.push(`id__${reportId}`);
   const reportDate = normalizeReportDateKey(report.reportDate);
-  const rawArea = String(report.areaId || '').trim();
-  if(rawArea && reportDate) keys.push(reportLocalKey(rawArea, reportDate));
-  const namedArea = areaName(rawArea);
-  if(namedArea && namedArea !== rawArea && reportDate) keys.push(reportLocalKey(namedArea, reportDate));
+  if(reportDate){
+    reportAreaAliases(report.areaId).forEach(area => keys.push(reportLocalKey(area, reportDate)));
+  }
   return [...new Set(keys)];
+}
+
+function getFuzzyLocalUpdatedAtOverride(report){
+  if(!report) return '';
+  const reportDate = normalizeReportDateKey(report.reportDate);
+  if(!reportDate) return '';
+  const areaKeys = new Set(reportAreaAliases(report.areaId).map(normalizeSearchText).filter(Boolean));
+  const now = Date.now();
+  let best = null;
+  Object.keys(localUpdatedAtOverrides).forEach(key => {
+    const item = localUpdatedAtOverrides[key];
+    if(!item || now > item.expiresAt){
+      delete localUpdatedAtOverrides[key];
+      return;
+    }
+    if(!key.startsWith('areaDate__')) return;
+    const parts = key.split('__');
+    const keyArea = parts[1] || '';
+    const keyDate = parts.slice(2).join('__');
+    if(keyDate === reportDate && areaKeys.has(keyArea)){
+      if(!best || item.expiresAt > best.expiresAt) best = item;
+    }
+  });
+  return best ? best.value : '';
 }
 
 function setLocalUpdatedAtOverride(report){
@@ -486,7 +549,7 @@ function getActiveLocalUpdatedAtOverride(report){
     }
     return item.value;
   }
-  return '';
+  return getFuzzyLocalUpdatedAtOverride(report);
 }
 
 function getLatestActiveLocalUpdatedAt(){
@@ -599,6 +662,18 @@ function formatDateTimeShort(value){
       const mm = pad2(gmtZeroMatch[5]);
       const ss = pad2(gmtZeroMatch[6] || '00');
       return correctSheetTimeIfFutureShift(yy, mo, dd, hh, mm, ss);
+    }
+  }
+
+  const gmtZeroLooseMatch = cleaned.match(/([A-Za-z]{3})\s+(\d{1,2})\s+(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s+GMT[+-]0{4}/i);
+  if(gmtZeroLooseMatch){
+    const monthMap = {jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
+    const mo = monthMap[String(gmtZeroLooseMatch[1]).slice(0,3).toLowerCase()] || '';
+    if(mo){
+      return correctSheetTimeIfFutureShift(
+        gmtZeroLooseMatch[3], mo, pad2(gmtZeroLooseMatch[2]),
+        pad2(gmtZeroLooseMatch[4]), pad2(gmtZeroLooseMatch[5]), pad2(gmtZeroLooseMatch[6] || '00')
+      );
     }
   }
 
@@ -1707,6 +1782,12 @@ function renderEmptyTableState(){
   </td></tr>`;
 }
 
+function formatReportUpdatedAtForTable(report){
+  const trustedLocal = getActiveLocalUpdatedAtOverride(report);
+  if(trustedLocal) return formatDateTimeShort(trustedLocal);
+  return formatDateTimeShort(report.updatedAt || report.createdAt || '');
+}
+
 function renderReportTable(){
   const entries = getFilteredReports();
   const visibleRows = getVisibleTableReports(entries);
@@ -1721,7 +1802,7 @@ function renderReportTable(){
       ${METRICS.map(m => `<td class="num">${fmt(r[m.key])}</td>`).join('')}
       <td class="num">${fmt(reportTotal(r))}</td>
       <td>${html(r.note || '')}</td>
-      <td><span class="pill gray">${html(formatDateTimeShort(getActiveLocalUpdatedAtOverride(r) || r.updatedAt || r.createdAt || ''))}</span><br><span class="muted small">Lần cập nhật: ${fmt(r.updateCount || 1)}</span></td>
+      <td><span class="pill gray">${html(formatReportUpdatedAtForTable(r))}</span><br><span class="muted small">Lần cập nhật: ${fmt(r.updateCount || 1)}</span></td>
       <td><div class="icon-actions"><button class="icon-btn" title="Sửa" aria-label="Sửa báo cáo" onclick="fillReportFormById('${html(r.reportId)}')">✏️</button><button class="icon-btn" title="Xóa" aria-label="Xóa báo cáo" onclick="handleDetailDelete('${html(r.reportId)}')">🗑️</button></div></td>
     </tr>`).join('');
 }
