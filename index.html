@@ -391,15 +391,23 @@ let filterCache = { key:'', data:[] };
 let pendingAreaMismatch = null;
 let savingReport = false;
 let activeQuickFilter = '';
+let localUpdatedAtOverrides = {};
+const LOCAL_UPDATED_AT_OVERRIDE_MS = 10 * 60 * 1000;
 const VIETNAM_TIMEZONE = 'Asia/Ho_Chi_Minh';
-const PUBLIC_CACHE_KEY = 'uav_public_data_cache_v2';
+const PUBLIC_CACHE_KEY = 'uav_public_data_cache_v3';
 const PUBLIC_CACHE_MAX_AGE_MS = 10 * 60 * 1000;
 
 const $ = id => document.getElementById(id);
 const dateOffsetISO = (offsetDays=0) => {
-  const d = new Date();
-  d.setDate(d.getDate() + offsetDays);
-  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  const d = new Date(Date.now() + (offsetDays * 86400000));
+  const parts = new Intl.DateTimeFormat('vi-VN', {
+    timeZone: VIETNAM_TIMEZONE,
+    year:'numeric', month:'2-digit', day:'2-digit'
+  }).formatToParts(d).reduce((acc, part) => {
+    if(part.type !== 'literal') acc[part.type] = part.value;
+    return acc;
+  }, {});
+  return `${parts.year}-${pad2(parts.month)}-${pad2(parts.day)}`;
 };
 const todayISO = () => dateOffsetISO(0);
 const yesterdayISO = () => dateOffsetISO(-1);
@@ -422,12 +430,152 @@ function formatDateObjVietnam(d){
   }, {});
   return `${pad2(parts.hour || '00')}:${pad2(parts.minute || '00')}:${pad2(parts.second || '00')} - ${pad2(parts.day || '01')}/${pad2(parts.month || '01')}/${parts.year || ''}`;
 }
+
+function formatDatePartsDisplay(yy, mo, dd, hh, mm, ss){
+  return `${pad2(hh || '00')}:${pad2(mm || '00')}:${pad2(ss || '00')} - ${pad2(dd || '01')}/${pad2(mo || '01')}/${yy || ''}`;
+}
+
+function getVietnamPartsAsUtcDate(d=new Date()){
+  const parts = new Intl.DateTimeFormat('vi-VN', {
+    timeZone: VIETNAM_TIMEZONE,
+    year:'numeric', month:'2-digit', day:'2-digit',
+    hour:'2-digit', minute:'2-digit', second:'2-digit',
+    hour12:false, hourCycle:'h23'
+  }).formatToParts(d).reduce((acc, part) => {
+    if(part.type !== 'literal') acc[part.type] = part.value;
+    return acc;
+  }, {});
+  return new Date(Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour || 0), Number(parts.minute || 0), Number(parts.second || 0)));
+}
+
+function correctSheetTimeIfFutureShift(yy, mo, dd, hh, mm, ss){
+  const shown = new Date(Date.UTC(Number(yy), Number(mo) - 1, Number(dd), Number(hh || 0), Number(mm || 0), Number(ss || 0)));
+  if(Number.isNaN(shown.getTime())) return formatDatePartsDisplay(yy, mo, dd, hh, mm, ss);
+
+  // Một số phản hồi sau khi đồng bộ từ Apps Script/Sheet bị đẩy lên trước đúng 7 giờ.
+  // Nếu thời gian hiển thị đang nằm trong tương lai khoảng 7 giờ so với giờ Việt Nam hiện tại,
+  // trừ lại 7 giờ để giữ đúng thời điểm cập nhật thực tế vừa ghi nhận trên giao diện.
+  const nowVn = getVietnamPartsAsUtcDate();
+  const diff = shown.getTime() - nowVn.getTime();
+  if(diff > 6 * 3600000 && diff < 8 * 3600000){
+    shown.setUTCHours(shown.getUTCHours() - 7);
+    return formatDatePartsDisplay(shown.getUTCFullYear(), shown.getUTCMonth() + 1, shown.getUTCDate(), shown.getUTCHours(), shown.getUTCMinutes(), shown.getUTCSeconds());
+  }
+  return formatDatePartsDisplay(yy, mo, dd, hh, mm, ss);
+}
+
+function getFilterUpdatedAtText(){
+  const el = $('lastUpdatedPill');
+  const text = el ? String(el.textContent || '') : '';
+  const match = text.match(/(\d{1,2}:\d{2}:\d{2}\s*-\s*\d{1,2}\/\d{1,2}\/\d{4})/);
+  return match ? formatDateTimeShort(match[1]) : '';
+}
+
+function setFilterUpdatedAtNow(){
+  const value = nowText();
+  const el = $('lastUpdatedPill');
+  if(el) el.textContent = 'Cập nhật: ' + value;
+  return getFilterUpdatedAtText() || value;
+}
+
+function normalizeReportDateKey(value){
+  const s = String(value || '').trim();
+  if(!s) return '';
+  const iso = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if(iso) return `${iso[1]}-${pad2(iso[2])}-${pad2(iso[3])}`;
+  const vn = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
+  if(vn) return `${vn[3]}-${pad2(vn[2])}-${pad2(vn[1])}`;
+  return s;
+}
+
+function reportLocalKey(areaId, reportDate){
+  return `areaDate__${normalizeSearchText(areaId)}__${normalizeReportDateKey(reportDate)}`;
+}
+
+function reportOverrideKeys(report){
+  const keys = [];
+  if(!report) return keys;
+  const reportId = String(report.reportId || '').trim();
+  if(reportId) keys.push(`id__${reportId}`);
+  const reportDate = normalizeReportDateKey(report.reportDate);
+  const rawArea = String(report.areaId || '').trim();
+  if(rawArea && reportDate) keys.push(reportLocalKey(rawArea, reportDate));
+  const namedArea = areaName(rawArea);
+  if(namedArea && namedArea !== rawArea && reportDate) keys.push(reportLocalKey(namedArea, reportDate));
+  return [...new Set(keys)];
+}
+
+function setLocalUpdatedAtOverride(report){
+  if(!report || !report.updatedAt) return;
+  const override = {
+    value: report.updatedAt,
+    expiresAt: Date.now() + LOCAL_UPDATED_AT_OVERRIDE_MS
+  };
+  reportOverrideKeys(report).forEach(key => {
+    localUpdatedAtOverrides[key] = override;
+  });
+}
+
+function getActiveLocalUpdatedAtOverride(report){
+  const keys = reportOverrideKeys(report);
+  for(const key of keys){
+    const item = localUpdatedAtOverrides[key];
+    if(!item) continue;
+    if(Date.now() > item.expiresAt){
+      delete localUpdatedAtOverrides[key];
+      continue;
+    }
+    return item.value;
+  }
+  return '';
+}
+
+function getLatestActiveLocalUpdatedAt(){
+  const now = Date.now();
+  let latest = null;
+  Object.keys(localUpdatedAtOverrides).forEach(key => {
+    const item = localUpdatedAtOverrides[key];
+    if(!item || now > item.expiresAt){
+      delete localUpdatedAtOverrides[key];
+      return;
+    }
+    if(!latest || item.expiresAt > latest.expiresAt) latest = item;
+  });
+  return latest ? latest.value : '';
+}
+
+function applyLocalUpdatedAtOverride(report){
+  const value = getActiveLocalUpdatedAtOverride(report);
+  return value ? Object.assign({}, report, { updatedAt:value }) : report;
+}
+
+function isGoogleSheetSerialDate(n){
+  // Google Sheet có thể trả ô ngày-giờ dưới dạng số sê-ri, ví dụ 46157.2319.
+  // Khoảng này đủ rộng cho các năm sử dụng thực tế, tránh nhầm với timestamp mili-giây.
+  return Number.isFinite(n) && n > 20000 && n < 80000;
+}
+
+function formatGoogleSheetSerialDate(n){
+  if(!isGoogleSheetSerialDate(n)) return '';
+  const d = new Date(Math.round((n - 25569) * 86400000));
+  if(Number.isNaN(d.getTime())) return '';
+  // Quan trọng: dùng UTC component để KHÔNG cộng thêm múi giờ +07 lần nữa.
+  const yy = d.getUTCFullYear();
+  const mo = d.getUTCMonth() + 1;
+  const dd = d.getUTCDate();
+  const hh = d.getUTCHours();
+  const mm = d.getUTCMinutes();
+  const ss = d.getUTCSeconds();
+  return correctSheetTimeIfFutureShift(yy, mo, dd, hh, mm, ss);
+}
+
 function formatDateTimeShort(value){
   if(!value && value !== 0) return '';
   if(value instanceof Date && !Number.isNaN(value.getTime())) return formatDateObjVietnam(value);
   if(typeof value === 'number'){
     const n = Number(value);
-    const d = n > 10000000000 ? new Date(n) : new Date((n - 25569) * 86400000);
+    if(isGoogleSheetSerialDate(n)) return formatGoogleSheetSerialDate(n);
+    const d = n > 10000000000 ? new Date(n) : new Date(n * 1000);
     return Number.isNaN(d.getTime()) ? String(value) : formatDateObjVietnam(d);
   }
 
@@ -439,8 +587,33 @@ function formatDateTimeShort(value){
     .replace(/\s+/g, ' ')
     .trim();
 
-  const direct = new Date(cleaned);
-  if(!Number.isNaN(direct.getTime())) return formatDateObjVietnam(direct);
+  // Google Sheet/App Script có lúc trả số sê-ri ở dạng chuỗi.
+  // Phải xử lý trước new Date() để tránh trình duyệt tự cộng thêm 7 giờ.
+  if(/^\d+(?:[.,]\d+)?$/.test(cleaned)){
+    const n = Number(cleaned.replace(',', '.'));
+    if(isGoogleSheetSerialDate(n)) return formatGoogleSheetSerialDate(n);
+  }
+
+  // Google Sheet/App Script đôi khi trả thời gian dạng ISO.
+  // Với giá trị không có timezone, Z hoặc offset 00:00 do Apps Script/Sheet trả về như giờ đã ghi trong Sheet,
+  // giữ nguyên thành phần ngày-giờ để tránh bị cộng thêm 7 giờ khi đồng bộ lại dữ liệu.
+  // Với offset thật khác 00:00 (+07:00, -05:00...) thì parse bằng Date rồi chuyển về giờ Việt Nam.
+  const isoLocalMatch = cleaned.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T\s]+)(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?$/);
+  if(isoLocalMatch){
+    const yy = isoLocalMatch[1];
+    const mo = pad2(isoLocalMatch[2]);
+    const dd = pad2(isoLocalMatch[3]);
+    const hh = pad2(isoLocalMatch[4]);
+    const mm = pad2(isoLocalMatch[5]);
+    const ss = pad2(isoLocalMatch[6] || '00');
+    const timezonePart = isoLocalMatch[7] || '';
+    const zeroOffset = /^Z$/i.test(timezonePart) || /^[+-]00:?00$/.test(timezonePart);
+    if(timezonePart && !zeroOffset){
+      const d = new Date(cleaned);
+      return Number.isNaN(d.getTime()) ? cleaned : formatDateObjVietnam(d);
+    }
+    return correctSheetTimeIfFutureShift(yy, mo, dd, hh, mm, ss);
+  }
 
   const timeMatch = cleaned.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
   const dateMatch = cleaned.match(/(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})/);
@@ -451,8 +624,28 @@ function formatDateTimeShort(value){
     const dd = pad2(dateMatch[1]);
     const mo = pad2(dateMatch[2]);
     const yy = dateMatch[3];
-    return `${hh}:${mm}:${ss} - ${dd}/${mo}/${yy}`;
+    return correctSheetTimeIfFutureShift(yy, mo, dd, hh, mm, ss);
   }
+
+  // Apps Script/Sheet có thể trả chuỗi Date kiểu JavaScript kèm GMT+0000,
+  // nhưng giờ trong chuỗi vẫn là giờ đã ghi ở Sheet nên không parse trực tiếp bằng Date.
+  const gmtZeroMatch = cleaned.match(/^[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s+GMT[+-]0{4}/i);
+  if(gmtZeroMatch){
+    const monthMap = {jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
+    const mo = monthMap[String(gmtZeroMatch[1]).slice(0,3).toLowerCase()] || '';
+    if(mo){
+      const dd = pad2(gmtZeroMatch[2]);
+      const yy = gmtZeroMatch[3];
+      const hh = pad2(gmtZeroMatch[4]);
+      const mm = pad2(gmtZeroMatch[5]);
+      const ss = pad2(gmtZeroMatch[6] || '00');
+      return correctSheetTimeIfFutureShift(yy, mo, dd, hh, mm, ss);
+    }
+  }
+
+  const direct = new Date(cleaned);
+  if(!Number.isNaN(direct.getTime())) return formatDateObjVietnam(direct);
+
   const vnDateMatch = cleaned.match(/(\d{1,2})\s*tháng\s*(\d{1,2})(?:,|\s*năm)?\s*(\d{4})/i);
   if(timeMatch && vnDateMatch){
     const hh = pad2(timeMatch[1]);
@@ -461,7 +654,7 @@ function formatDateTimeShort(value){
     const dd = pad2(vnDateMatch[1]);
     const mo = pad2(vnDateMatch[2]);
     const yy = vnDateMatch[3];
-    return `${hh}:${mm}:${ss} - ${dd}/${mo}/${yy}`;
+    return correctSheetTimeIfFutureShift(yy, mo, dd, hh, mm, ss);
   }
   return cleaned;
 }
@@ -540,7 +733,7 @@ async function refreshData(checkConnection=false, quiet=false){
     setApiStatus(quiet ? 'Đang đồng bộ lại Google Sheet...' : 'Đang tải dữ liệu từ Google Sheet...', 'wait');
     const data = await callApi('getPublicData', {});
     app.areas = Array.isArray(data.areas) ? data.areas : [];
-    app.reports = Array.isArray(data.reports) ? data.reports.map(normalizeReport) : [];
+    app.reports = Array.isArray(data.reports) ? data.reports.map(normalizeReport).map(applyLocalUpdatedAtOverride) : [];
     app.dataVersion = (app.dataVersion || 0) + 1;
     filterCache.key = '';
     app.settings = data.settings || {};
@@ -553,7 +746,8 @@ async function refreshData(checkConnection=false, quiet=false){
     if(!app.users.length) ensureAuthUsersLoaded(false);
     cachePublicData();
     setApiStatus('Đã tải dữ liệu thành công.', 'ok');
-    $('lastUpdatedPill').textContent = 'Cập nhật: ' + nowText();
+    const filterUpdatedAtText = quiet ? getLatestActiveLocalUpdatedAt() : '';
+    $('lastUpdatedPill').textContent = 'Cập nhật: ' + (filterUpdatedAtText || nowText());
   }catch(err){
     console.error(err);
     setApiStatus((quiet ? 'Đã lưu, nhưng chưa đồng bộ lại được: ' : 'Lỗi tải dữ liệu: ') + err.message, 'err');
@@ -564,7 +758,21 @@ async function refreshData(checkConnection=false, quiet=false){
 function normalizeReport(r){
   const copy = Object.assign({}, r);
   METRICS.forEach(m => copy[m.key] = num(copy[m.key]));
-  copy.updateCount = num(copy.updateCount) || 1;
+
+  // Chuẩn hóa các tên cột thời gian có thể trả về từ Apps Script/Google Sheet.
+  // Việc này giúp cột "Cập nhật" trong Bảng số liệu chi tiết luôn lấy đúng thời điểm cập nhật mới nhất.
+  copy.updatedAt = copy.updatedAt || pickField(copy, [
+    'updatedAt','updated_at','lastUpdated','last_updated','updateAt','update_at','modifiedAt','modified_at',
+    'timeUpdated','time_updated','timestamp','Timestamp','Thời gian cập nhật','Thoi gian cap nhat',
+    'Cập nhật','Cap nhat','Ngày cập nhật','Ngay cap nhat','updatedTime','updated_time'
+  ]);
+  copy.createdAt = copy.createdAt || pickField(copy, [
+    'createdAt','created_at','createdTime','created_time','createdDate','created_date',
+    'Thời gian tạo','Thoi gian tao','Ngày tạo','Ngay tao'
+  ]);
+  copy.updateCount = num(copy.updateCount || pickField(copy, [
+    'updateCount','update_count','lanCapNhat','lan_cap_nhat','Lần cập nhật','Lan cap nhat'
+  ])) || 1;
   return copy;
 }
 
@@ -589,7 +797,7 @@ function loadCachedPublicData(){
     const cached = JSON.parse(raw);
     if(!cached || !cached.cachedAt || Date.now() - Number(cached.cachedAt) > PUBLIC_CACHE_MAX_AGE_MS) return false;
     app.areas = Array.isArray(cached.areas) ? cached.areas : [];
-    app.reports = Array.isArray(cached.reports) ? cached.reports.map(normalizeReport) : [];
+    app.reports = Array.isArray(cached.reports) ? cached.reports.map(normalizeReport).map(applyLocalUpdatedAtOverride) : [];
     app.settings = cached.settings || {};
     app.users = Array.isArray(cached.users) ? cached.users.map(normalizeUser) : [];
     app.dataVersion = (app.dataVersion || 0) + 1;
@@ -609,15 +817,19 @@ function loadCachedPublicData(){
 }
 
 function upsertReportInMemory(report, serverReport={}){
+  const filterUpdatedAtText = setFilterUpdatedAtNow();
   const currentIndex = app.reports.findIndex(r => r.areaId === report.areaId && r.reportDate === report.reportDate && String(r.status || 'active') !== 'deleted');
   const base = currentIndex >= 0 ? app.reports[currentIndex] : {};
   const merged = normalizeReport(Object.assign({}, base, report, serverReport, {
     reportId: serverReport.reportId || base.reportId || `pending-${report.areaId}-${report.reportDate}-${Date.now()}`,
     status: serverReport.status || base.status || 'active',
-    createdAt: serverReport.createdAt || base.createdAt || nowText(),
-    updatedAt: serverReport.updatedAt || nowText(),
+    createdAt: serverReport.createdAt || base.createdAt || filterUpdatedAtText,
+    updatedAt: filterUpdatedAtText,
     updateCount: serverReport.updateCount || (currentIndex >= 0 ? num(base.updateCount) + 1 : 1)
   }));
+  setLocalUpdatedAtOverride(Object.assign({}, report, { reportId:merged.reportId, updatedAt:filterUpdatedAtText }));
+  setLocalUpdatedAtOverride(Object.assign({}, serverReport, { reportId:merged.reportId, updatedAt:filterUpdatedAtText }));
+  setLocalUpdatedAtOverride(merged);
   if(currentIndex >= 0) app.reports[currentIndex] = merged;
   else app.reports.push(merged);
   app.dataVersion = (app.dataVersion || 0) + 1;
@@ -1145,10 +1357,28 @@ function sameAreaValue(userArea, areaId){
   return userText === normalizeSearchText(areaId) || userText === normalizeSearchText(area.name || '');
 }
 
+function responsibleTextValue(user){
+  return normalizeSearchText([user && user.position, user && user.role].filter(Boolean).join(' '));
+}
+
+function responsibleTitle(user){
+  const text = responsibleTextValue(user);
+  if(!text) return '';
+  if(text.includes('thanh vien') || text.includes('thanhvien') || text.includes('to vien') || text.includes('member')) return '';
+  if(text.includes('to truong') || text.includes('truong')) return 'Tổ trưởng';
+  if(text.includes('to pho') || text.includes('pho')) return 'Tổ phó';
+  if(text.includes('area_lead') || text.includes('area lead') || text.includes('lead')) return 'Tổ trưởng/Tổ phó';
+  return '';
+}
+
+function isAreaResponsibleUser(user){
+  return !!responsibleTitle(user);
+}
+
 function responsibleRank(user){
-  const text = normalizeSearchText([user.position, user.role].filter(Boolean).join(' '));
-  if(text.includes('to truong') || text.includes('truong')) return 0;
-  if(text.includes('to pho') || text.includes('pho')) return 1;
+  const title = normalizeSearchText(responsibleTitle(user));
+  if(title === 'to truong') return 0;
+  if(title === 'to pho') return 1;
   return 2;
 }
 
@@ -1162,6 +1392,7 @@ function getAreaResponsibleUsers(areaId){
       const role = normalizeSearchText(u.role || '');
       if(status && !['active','hoat dong','dang hoat dong'].includes(status)) return false;
       if(role === 'admin' || role.includes('viewer') || role.includes('chi xem')) return false;
+      if(!isAreaResponsibleUser(u)) return false;
       if(!sameAreaValue(u.areaId, areaId)) return false;
       const key = normalizeSearchText([u.phone, u.username, u.fullName].filter(Boolean).join('|'));
       if(!key || seen.has(key)) return false;
@@ -1175,8 +1406,8 @@ function renderResponsiblePeople(areaId, emptyText='Chưa có thông tin Tổ tr
   const people = getAreaResponsibleUsers(areaId);
   if(!people.length) return `<div class="filter-summary-sub">${html(emptyText)}</div>`;
   return `<div class="responsible-list">${people.map(u => {
-    const login = [u.phone ? `SĐT: ${u.phone}` : '', u.username && u.username !== u.phone ? `Tài khoản: ${u.username}` : ''].filter(Boolean).join(' • ');
-    return `<div class="responsible-person"><b>${html(safeUserName(u))}</b><span>${html(roleText(u))}</span><span>${html(login || 'Chưa có số điện thoại')}</span></div>`;
+    const phone = String(u.phone || '').trim();
+    return `<div class="responsible-person"><b>${html(safeUserName(u))}</b><span>${html(responsibleTitle(u))}</span><span>${html(phone ? `SĐT: ${phone}` : 'Chưa có số điện thoại')}</span></div>`;
   }).join('')}</div>`;
 }
 
@@ -1364,7 +1595,7 @@ function renderReportTable(){
       ${METRICS.map(m => `<td class="num">${fmt(r[m.key])}</td>`).join('')}
       <td class="num">${fmt(reportTotal(r))}</td>
       <td>${html(r.note || '')}</td>
-      <td><span class="pill gray">${html(formatDateTimeShort(r.updatedAt || r.createdAt || ''))}</span><br><span class="muted small">Lần cập nhật: ${fmt(r.updateCount || 1)}</span></td>
+      <td><span class="pill gray">${html(formatDateTimeShort(getActiveLocalUpdatedAtOverride(r) || r.updatedAt || r.createdAt || ''))}</span><br><span class="muted small">Lần cập nhật: ${fmt(r.updateCount || 1)}</span></td>
       <td><button class="btn btn-light" onclick="fillReportFormById('${html(r.reportId)}')">Sửa</button></td>
     </tr>`).join('');
 }
