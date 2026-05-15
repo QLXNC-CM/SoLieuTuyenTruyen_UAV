@@ -2046,7 +2046,7 @@ function renderAreaSummary(){
     return isYesterday ? normalizeReportDateKey(r.reportDate) === targetDate : true;
   });
   const totals = totalsOf(entries);
-  if(title) title.textContent = isYesterday ? `Số liệu hôm qua địa bàn ${selectedAreaName}` : `Lũy kế địa bàn đang chọn (${selectedAreaName})`;
+  if(title) title.textContent = isYesterday ? `Số liệu hôm qua địa bàn ${selectedAreaName}` : `Lũy kế địa bàn đang chọn tại phần báo cáo, cập nhật số liệu (${selectedAreaName})`;
   const meta = isYesterday
     ? `<div class="area-summary-meta"><b>Đang xem:</b> Số liệu hôm qua (${dateText(targetDate)}) của địa bàn ${html(selectedAreaName)}${entries.length ? '' : ' - chưa có dòng báo cáo, tạm hiển thị 0.'}</div>`
     : `<div class="area-summary-meta"><b>Đang xem:</b> Lũy kế toàn bộ dữ liệu của địa bàn ${html(selectedAreaName)}.</div>`;
